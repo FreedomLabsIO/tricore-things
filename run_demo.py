@@ -113,7 +113,7 @@ def miniwiggler_sync(batch: DAPBatch, interface: MiniWigglerBatch) -> None:
             "MiniWiggler DAP sync did not respond after the capture-derived "
             "pre-init. Verify that the MiniWiggler debug interface is still "
             "bound to WinUSB and that no DAS/MemTool process is holding the "
-            "adapter open."
+            "adapter open. Make sure to kill 'tas_server.exe' after Windows restart or MemTool execution!"
         )
 
 
