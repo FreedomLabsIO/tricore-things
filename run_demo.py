@@ -223,13 +223,21 @@ class RawDapSession:
     ops: DAPOperations
     before_status: int
     final_status: int
+    identity_probe: str | None = None
 
 
 class UnlockFailure(RuntimeError):
-    def __init__(self, before_status: int, final_status: int, hint: str) -> None:
+    def __init__(
+        self,
+        before_status: int,
+        final_status: int,
+        hint: str,
+        identity_probe: str | None = None,
+    ) -> None:
         self.before_status = before_status
         self.final_status = final_status
         self.hint = hint
+        self.identity_probe = identity_probe
         super().__init__(
             f"Unlock failed after the password sequence; final DAP status was "
             f"0x{final_status:03x}. {hint}"
@@ -271,6 +279,21 @@ def format_attempt_status_line(
         f"final DAP status was 0x{final_status:03x}. | {result}"
     )
     return line
+
+
+def probe_identity_read(batch: DAPBatch) -> str:
+    ops = DAPOperations(batch)
+    try:
+        sbu_id = ops.read32(SBU_ID)
+        manid = ops.read32(SBU_MANID)
+        chipid = ops.read32(SBU_CHIPID)
+    except Exception as exc:
+        return f"Identity read failed: {exc}"
+    return (
+        f"SBU_ID=0x{sbu_id:08x} "
+        f"SBU_MANID=0x{manid:08x} "
+        f"SBU_CHIPID=0x{chipid:08x}"
+    )
 
 
 def prefer_mcd_backend(use_miniwiggler: bool) -> bool:
@@ -374,6 +397,7 @@ def open_raw_dap(
 ) -> RawDapSession:
     ftdi: Ftdi | None = None
     try:
+        identity_probe: str | None = None
         ftdi = open_ftdi_device(use_miniwiggler)
 
         if use_miniwiggler:
@@ -454,12 +478,17 @@ def open_raw_dap(
                 batch.dap_set_io_client(1)
                 final_status = batch.dap_readreg(0xB, 2)
                 batch.exec()
+                identity_probe = None
+                if (final_status.value or 0) == 0x080:
+                    identity_probe = probe_identity_read(batch)
                 if (final_status.value or 0) != 0x400:
                     raise UnlockFailure(
                         before_status=dap_status,
                         final_status=final_status.value or 0,
                         hint=unlock_failure_hint(final_status.value or 0),
+                        identity_probe=identity_probe,
                     )
+                identity_probe = probe_identity_read(batch)
 
                 if not compact_log:
                     print("Unlocked with capture-derived MiniWiggler sequence")
@@ -511,12 +540,17 @@ def open_raw_dap(
                 batch.dap_set_io_client(1)
                 final_status = batch.dap_readreg(0xB, 2)
                 batch.exec()
+                identity_probe = None
+                if (final_status.value or 0) == 0x080:
+                    identity_probe = probe_identity_read(batch)
                 if (final_status.value or 0) != 0x400:
                     raise UnlockFailure(
                         before_status=dap_status,
                         final_status=final_status.value or 0,
                         hint=unlock_failure_hint(final_status.value or 0),
+                        identity_probe=identity_probe,
                     )
+                identity_probe = probe_identity_read(batch)
                 if not compact_log:
                     print("Unlocked")
                     print("DAP status after unlock handling: 0x400")
@@ -534,11 +568,15 @@ def open_raw_dap(
         batch.mpsse_set_clk_freq(5_000_000)
         batch.exec()
 
+        if identity_probe is None:
+            identity_probe = probe_identity_read(batch)
+
         return RawDapSession(
             ftdi=ftdi,
             ops=DAPOperations(batch),
             before_status=dap_status,
             final_status=0x400,
+            identity_probe=identity_probe,
         )
     except Exception:
         if ftdi is not None:
@@ -737,7 +775,11 @@ def main() -> None:
                                 delay_ns=current_delay,
                             )
                         )
+                        if raw_session.identity_probe is not None:
+                            print(f"Identity read: {raw_session.identity_probe}")
                     print("Using backend: raw MPSSE/DAP")
+                    if not (args.loop or delay_schedule is not None) and raw_session.identity_probe is not None:
+                        print(f"Identity read: {raw_session.identity_probe}")
 
                 if run_self_test:
                     ref = random.randbytes(0x400)
@@ -828,6 +870,8 @@ def main() -> None:
                 if not args.loop and delay_schedule is None:
                     raise
                 print(exc.format_summary(attempt, delay_ns=current_delay))
+                if exc.identity_probe is not None:
+                    print(f"Identity read: {exc.identity_probe}")
                 time.sleep(0.2)
             except Exception as exc:
                 last_failure = exc
