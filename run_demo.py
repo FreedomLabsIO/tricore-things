@@ -641,12 +641,44 @@ def build_delay_schedule(args: argparse.Namespace) -> list[int] | None:
     return delays
 
 
+def format_runtime_estimate(total_seconds: int) -> str:
+    days, rem = divmod(total_seconds, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes, seconds = divmod(rem, 60)
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if days or hours:
+        parts.append(f"{hours}h")
+    if days or hours or minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
 def main() -> None:
     args = parse_args()
     run_self_test = True
     use_miniwiggler = True
     base_addr = 0x7000002C
     delay_schedule = build_delay_schedule(args)
+
+    if delay_schedule is not None:
+        total_attempts = len(delay_schedule)
+        estimated_seconds = total_attempts
+        estimate_text = format_runtime_estimate(estimated_seconds)
+        if args.loop:
+            print(
+                "Estimated runtime per full delay sweep: "
+                f"{estimate_text} ({total_attempts:,} attempts at ~1s each). "
+                "With --loop, this sweep repeats indefinitely."
+            )
+        else:
+            print(
+                "Estimated runtime: "
+                f"{estimate_text} ({total_attempts:,} attempts at ~1s each)."
+            )
 
     trigger_serial = None
     if args.com_port:
