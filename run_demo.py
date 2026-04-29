@@ -235,10 +235,10 @@ class UnlockFailure(RuntimeError):
             f"0x{final_status:03x}. {hint}"
         )
 
-    def format_summary(self, attempt: int, delay_s: float | None = None) -> str:
+    def format_summary(self, attempt: int, delay_ns: int | None = None) -> str:
         line = f"Unlock attempt {attempt}  "
-        if delay_s is not None:
-            line += f"delay: {delay_s:.6f}s | "
+        if delay_ns is not None:
+            line += f"delay: {delay_ns}ns | "
         line += (
             f"DAP status before unlock: 0x{self.before_status:03x} | "
             f"final DAP status was 0x{self.final_status:03x}. | FAILED"
@@ -261,11 +261,11 @@ def format_attempt_status_line(
     before_status: int,
     final_status: int,
     result: str,
-    delay_s: float | None = None,
+    delay_ns: int | None = None,
 ) -> str:
     line = f"Unlock attempt {attempt}  "
-    if delay_s is not None:
-        line += f"delay: {delay_s:.6f}s | "
+    if delay_ns is not None:
+        line += f"delay: {delay_ns}ns | "
     line += (
         f"DAP status before unlock: 0x{before_status:03x} | "
         f"final DAP status was 0x{final_status:03x}. | {result}"
@@ -327,20 +327,37 @@ def open_trigger_serial(port: str):
     )
 
 
+def wait_delay_ns(delay_ns: int) -> None:
+    if delay_ns <= 0:
+        return
+
+    target = time.perf_counter_ns() + delay_ns
+
+    # Use sleep for the coarse portion, then spin to reduce scheduler jitter.
+    sleep_cutoff_ns = 500_000
+    if delay_ns > sleep_cutoff_ns:
+        remaining_ns = target - time.perf_counter_ns() - sleep_cutoff_ns
+        if remaining_ns > 0:
+            time.sleep(remaining_ns / 1_000_000_000)
+
+    while time.perf_counter_ns() < target:
+        pass
+
+
 def send_post_password_command(
     trigger_serial,
     verbose_unlock: bool,
-    delay_s: float = 0.0,
+    delay_ns: int = 0,
 ) -> None:
     if trigger_serial is None:
         return
-    if delay_s > 0:
+    if delay_ns > 0:
         if verbose_unlock:
             print(
-                f'waiting {delay_s:.6f}s before sending "p<cr>" on '
+                f'waiting {delay_ns}ns before sending "p<cr>" on '
                 f"{trigger_serial.port}"
             )
-        time.sleep(delay_s)
+        wait_delay_ns(delay_ns)
     trigger_serial.write(b"p\r")
     trigger_serial.flush()
     if verbose_unlock:
@@ -353,7 +370,7 @@ def open_raw_dap(
     password_pause: bool = False,
     trigger_serial=None,
     compact_log: bool = False,
-    trigger_delay_s: float = 0.0,
+    trigger_delay_ns: int = 0,
 ) -> RawDapSession:
     ftdi: Ftdi | None = None
     try:
@@ -428,7 +445,7 @@ def open_raw_dap(
                         send_post_password_command(
                             trigger_serial,
                             verbose_unlock,
-                            delay_s=trigger_delay_s,
+                            delay_ns=trigger_delay_ns,
                         )
 
                 batch.dap_set_io_client(2)
@@ -484,7 +501,7 @@ def open_raw_dap(
                         send_post_password_command(
                             trigger_serial,
                             verbose_unlock,
-                            delay_s=trigger_delay_s,
+                            delay_ns=trigger_delay_ns,
                         )
                 batch.dap_set_io_client(2)
                 batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
@@ -564,24 +581,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--start-delay",
-        type=float,
+        type=int,
         help=(
-            "Delay in seconds before sending 'p<cr>' on the COM port for the "
+            "Delay in nanoseconds before sending 'p<cr>' on the COM port for the "
             "first sweep value."
         ),
     )
     parser.add_argument(
         "--end-delay",
-        type=float,
+        type=int,
         help=(
-            "Maximum delay in seconds to try before sending 'p<cr>' on the "
+            "Maximum delay in nanoseconds to try before sending 'p<cr>' on the "
             "COM port."
         ),
     )
     parser.add_argument(
         "--increment",
-        type=float,
-        help="Increment in seconds between COM trigger delay sweep values.",
+        type=int,
+        help="Increment in nanoseconds between COM trigger delay sweep values.",
     )
     parser.add_argument(
         "--attempts",
@@ -591,7 +608,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_delay_schedule(args: argparse.Namespace) -> list[float] | None:
+def build_delay_schedule(args: argparse.Namespace) -> list[int] | None:
     delay_values = [
         args.start_delay,
         args.end_delay,
@@ -616,12 +633,10 @@ def build_delay_schedule(args: argparse.Namespace) -> list[float] | None:
     if args.attempts <= 0:
         raise ValueError("--attempts must be greater than zero.")
 
-    delays: list[float] = []
+    delays: list[int] = []
     current = args.start_delay
-    epsilon = args.increment / 1000.0
-    while current <= args.end_delay + epsilon:
-        rounded = round(current, 12)
-        delays.extend([rounded] * args.attempts)
+    while current <= args.end_delay:
+        delays.extend([current] * args.attempts)
         current += args.increment
     return delays
 
@@ -665,7 +680,7 @@ def main() -> None:
                                 before_status=0x400,
                                 final_status=0x400,
                                 result="OK",
-                                delay_s=current_delay,
+                                delay_ns=current_delay,
                             )
                         )
                     print(f"Using backend: MCD ({mcd_session.device_name} / {mcd_session.core_name})")
@@ -676,7 +691,7 @@ def main() -> None:
                         password_pause=args.password_pause,
                         trigger_serial=trigger_serial,
                         compact_log=(args.loop or delay_schedule is not None),
-                        trigger_delay_s=current_delay or 0.0,
+                        trigger_delay_ns=current_delay or 0,
                     )
                     ftdi = raw_session.ftdi
                     ops = raw_session.ops
@@ -687,7 +702,7 @@ def main() -> None:
                                 before_status=raw_session.before_status,
                                 final_status=raw_session.final_status,
                                 result="OK",
-                                delay_s=current_delay,
+                                delay_ns=current_delay,
                             )
                         )
                     print("Using backend: raw MPSSE/DAP")
@@ -780,7 +795,7 @@ def main() -> None:
                 last_failure = exc
                 if not args.loop and delay_schedule is None:
                     raise
-                print(exc.format_summary(attempt, delay_s=current_delay))
+                print(exc.format_summary(attempt, delay_ns=current_delay))
                 time.sleep(0.2)
             except Exception as exc:
                 last_failure = exc
@@ -788,7 +803,7 @@ def main() -> None:
                     raise
                 line = f"Unlock attempt {attempt}  "
                 if current_delay is not None:
-                    line += f"delay: {current_delay:.6f}s | "
+                    line += f"delay: {current_delay}ns | "
                 line += f"FAILED | {exc}"
                 print(line)
                 time.sleep(0.2)
