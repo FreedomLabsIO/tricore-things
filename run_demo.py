@@ -5,6 +5,11 @@ import random
 import struct
 import time
 
+try:
+    import serial as pyserial
+except Exception:
+    pyserial = None
+
 from ftdi_compat import Ftdi
 from mcd_backend import McdSession, mcd_backend_available
 from miniwiggler_memtool_unlock import replay_miniwiggler_memtool_unlock_preamble
@@ -251,10 +256,34 @@ def pause_before_password_word(index: int, total: int) -> None:
         ) from exc
 
 
+def open_trigger_serial(port: str):
+    if pyserial is None:
+        raise RuntimeError(
+            "--com-port requires pyserial, but the serial module could not "
+            "be imported."
+        )
+    return pyserial.Serial(
+        port=port,
+        baudrate=115200,
+        timeout=1,
+        write_timeout=1,
+    )
+
+
+def send_post_password_command(trigger_serial, verbose_unlock: bool) -> None:
+    if trigger_serial is None:
+        return
+    trigger_serial.write(b"p\r")
+    trigger_serial.flush()
+    if verbose_unlock:
+        print(f'sent "p<cr>" on {trigger_serial.port}')
+
+
 def open_raw_dap(
     use_miniwiggler: bool,
     verbose_unlock: bool = False,
     password_pause: bool = False,
+    trigger_serial=None,
 ) -> tuple[Ftdi, DAPOperations]:
     ftdi = open_ftdi_device(use_miniwiggler)
 
@@ -321,6 +350,8 @@ def open_raw_dap(
                         f"password word {index + 1}/{len(UNLOCK_PASSWORD)} "
                         "sent while DAP status was 0x080"
                     )
+                if index + 1 == len(UNLOCK_PASSWORD):
+                    send_post_password_command(trigger_serial, verbose_unlock)
 
             batch.dap_set_io_client(2)
             batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
@@ -368,6 +399,8 @@ def open_raw_dap(
                 batch.dap_readreg(0xB, 2).then(AssertInt(0x80))
                 batch.write_comdata(pw)
                 batch.exec()
+                if index + 1 == len(UNLOCK_PASSWORD):
+                    send_post_password_command(trigger_serial, verbose_unlock)
             batch.dap_set_io_client(2)
             batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
             batch.dap_readreg(0xF, 2).then(AssertInt(0x0000))
@@ -413,6 +446,18 @@ def parse_args() -> argparse.Namespace:
             "unlock."
         ),
     )
+    parser.add_argument(
+        "--com-port",
+        help=(
+            "Open this COM port at startup and send 'p<cr>' immediately "
+            "after the last password word is sent."
+        ),
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="Keep retrying the unlock flow until one attempt succeeds.",
+    )
     return parser.parse_args()
 
 
@@ -422,109 +467,132 @@ def main() -> None:
     use_miniwiggler = True
     base_addr = 0x7000002C
 
-    ftdi: Ftdi | None = None
-    mcd_session: McdSession | None = None
+    trigger_serial = None
+    if args.com_port:
+        trigger_serial = open_trigger_serial(args.com_port)
+
+    attempt = 0
 
     try:
-        if prefer_mcd_backend(use_miniwiggler):
-            mcd_session = McdSession.connect_default()
-            mcd_session.reset_and_halt()
-            ops = mcd_session
-            print(f"Using backend: MCD ({mcd_session.device_name} / {mcd_session.core_name})")
-        else:
-            ftdi, ops = open_raw_dap(
-                use_miniwiggler,
-                verbose_unlock=args.verbose_unlock,
-                password_pause=args.password_pause,
-            )
-            print("Using backend: raw MPSSE/DAP")
+        while True:
+            ftdi: Ftdi | None = None
+            mcd_session: McdSession | None = None
+            attempt += 1
+            try:
+                if args.loop:
+                    print(f"Unlock attempt {attempt}")
 
-        if run_self_test:
-            ref = random.randbytes(0x400)
-            ops.write(base_addr, ref)
-            readback = ops.read(base_addr, 0x400)
-            assert readback == ref
+                if prefer_mcd_backend(use_miniwiggler):
+                    mcd_session = McdSession.connect_default()
+                    mcd_session.reset_and_halt()
+                    ops = mcd_session
+                    print(f"Using backend: MCD ({mcd_session.device_name} / {mcd_session.core_name})")
+                else:
+                    ftdi, ops = open_raw_dap(
+                        use_miniwiggler,
+                        verbose_unlock=args.verbose_unlock,
+                        password_pause=args.password_pause,
+                        trigger_serial=trigger_serial,
+                    )
+                    print("Using backend: raw MPSSE/DAP")
 
-            assert ops.read8(base_addr) == ref[0]
-            assert ops.read8(base_addr + 1) == ref[1]
-            assert ops.read8(base_addr + 2) == ref[2]
-            assert ops.read8(base_addr + 3) == ref[3]
-            assert ops.read16(base_addr) == struct.unpack("<H", ref[0:2])[0]
-            assert ops.read16(base_addr + 2) == struct.unpack("<H", ref[2:4])[0]
-            assert ops.read32(base_addr) == struct.unpack("<I", ref[0:4])[0]
-            assert ops.read32(base_addr + 4) == struct.unpack("<I", ref[4:8])[0]
+                if run_self_test:
+                    ref = random.randbytes(0x400)
+                    ops.write(base_addr, ref)
+                    readback = ops.read(base_addr, 0x400)
+                    assert readback == ref
 
-            ops.write8(base_addr, 0xA5)
-            assert 0xA5 == ops.read8(base_addr)
+                    assert ops.read8(base_addr) == ref[0]
+                    assert ops.read8(base_addr + 1) == ref[1]
+                    assert ops.read8(base_addr + 2) == ref[2]
+                    assert ops.read8(base_addr + 3) == ref[3]
+                    assert ops.read16(base_addr) == struct.unpack("<H", ref[0:2])[0]
+                    assert ops.read16(base_addr + 2) == struct.unpack("<H", ref[2:4])[0]
+                    assert ops.read32(base_addr) == struct.unpack("<I", ref[0:4])[0]
+                    assert ops.read32(base_addr + 4) == struct.unpack("<I", ref[4:8])[0]
 
-            ops.write16(base_addr, 0xC0FE)
-            assert 0xC0FE == ops.read16(base_addr)
+                    ops.write8(base_addr, 0xA5)
+                    assert 0xA5 == ops.read8(base_addr)
 
-            ops.write32(base_addr, 0xCAFEBABE)
-            assert 0xCAFEBABE == ops.read32(base_addr)
+                    ops.write16(base_addr, 0xC0FE)
+                    assert 0xC0FE == ops.read16(base_addr)
 
-            print("Self test completed successfully")
-            return
+                    ops.write32(base_addr, 0xCAFEBABE)
+                    assert 0xCAFEBABE == ops.read32(base_addr)
 
-        # Send Software Debug Event on CPU0
-        ops.write32(0xF881FD10, 0x2A)
-        # Halt all 6 CPUs
-        ops.write32(0xF881FD00, 6)
-        ops.write32(0xF883FD00, 6)
-        ops.write32(0xF885FD00, 6)
-        ops.write32(0xF887FD00, 6)
-        ops.write32(0xF889FD00, 6)
-        ops.write32(0xF88DFD00, 6)
+                    print("Self test completed successfully")
+                    return
 
-        # Set program counter on first CPU.
-        # 0x80000000 is the reset vector for running from flash.
-        ops.write32(0xF881FE08, 0x80000000)
+                # Send Software Debug Event on CPU0
+                ops.write32(0xF881FD10, 0x2A)
+                # Halt all 6 CPUs
+                ops.write32(0xF881FD00, 6)
+                ops.write32(0xF883FD00, 6)
+                ops.write32(0xF885FD00, 6)
+                ops.write32(0xF887FD00, 6)
+                ops.write32(0xF889FD00, 6)
+                ops.write32(0xF88DFD00, 6)
 
-        # Run CPU0 by resetting HALT[0].
-        # CPU0 will start other CPUs in the code running from flash.
-        ops.write(0xF881FD00, b"\x04\x00\x00\x00")
-        if mcd_session is not None:
-            mcd_session.run_global()
+                # Set program counter on first CPU.
+                # 0x80000000 is the reset vector for running from flash.
+                ops.write32(0xF881FE08, 0x80000000)
 
-        print(hex(ops.read32(0xF881FE08)))
-        print(hex(ops.read32(0xF883FE08)))
-        print(hex(ops.read32(0xF885FE08)))
-        print(hex(ops.read32(0xF887FE08)))
-        print(hex(ops.read32(0xF889FE08)))
-        print(hex(ops.read32(0xF88DFE08)))
+                # Run CPU0 by resetting HALT[0].
+                # CPU0 will start other CPUs in the code running from flash.
+                ops.write(0xF881FD00, b"\x04\x00\x00\x00")
+                if mcd_session is not None:
+                    mcd_session.run_global()
 
-        import base64
-        import zlib
+                print(hex(ops.read32(0xF881FE08)))
+                print(hex(ops.read32(0xF883FE08)))
+                print(hex(ops.read32(0xF885FE08)))
+                print(hex(ops.read32(0xF887FE08)))
+                print(hex(ops.read32(0xF889FE08)))
+                print(hex(ops.read32(0xF88DFE08)))
 
-        logo = zlib.decompress(
-            base64.decodebytes(
-                b"eJytlVty0zAUhhtZx7JiJ07SJDwALdMn2ADXcllAYQVAWQB7YB3cpsMwrFP9z5EtK/Kl"
-                b"ZeBBo3P5P0mWj6Qvbqb+OKVOXaZ+O63uO1K/0E7QrtAeIHaFRtDt0Qj2T/EztUXTja+h"
-                b"3aCx/0PihLwW/3vT7ySfBX/f9N+aceYuo3kSsy4niz6LYoUrqBBdpr42+qGYcXZSl46X"
-                b"JfMWYS2cI6xPRes7/Kb0my+xV+fJvrxH/yLZuw+InSf762N+7z+if4n+FD3br5p/dIn2"
-                b"GmOcoH2C/QbswuVoM6ypBkPqHfwzd6yeB3urnqF/K/ZOPQ32Xj0ZtHPsgznw5/Af/6PP"
-                b"411M+A9l3jiWq0eDMZK+jdmG5dgGtbR0hs6iXAV/1+TXjqh0JeXojdPEMW9z3M/F+eNI"
-                b"P3cLIvS52KzPxWZ9gfE5v4n01tWkR/Wsq2ndfHMt9bZq9Fo0sd7I+CtaHehzrCcn1Kas"
-                b"yzMm2MavRTSHnP/OMS6Xubym44z4HaepSjiCrryB4+/zXCF2ytUy9xCnaZFwWv7pIbdE"
-                b"3vvDTOZsb66Y4bk8Y8W+HaNRa75+Zqi7llOuDPvouQLn08o/Hee2qL2U0cjrwCnYdeA0"
-                b"/L/nFObzXIV1GlUkbNWMPc2W2JuY5TPTZ9leBZbXxOwc/z0P7FJqYJrNMG/HGmV6rN8L"
-                b"CiyFNXeslfqeZsuIs8R5Pt95xFTShhmN2iiRtz2mwFwxU4X/7xl/ZjrmrtQP18mYvozu"
-                b"rb7eyP61DPbslkx7BmLGKOox/jzznaJuYBbu3iTDd90wo0XfMlk40+OMdctGH983Y/pC"
-                b"/ssY074HfcaiJjzTvxNv4mrR9+/g/8F1fsd57TTLZ8JGrOG7Ss6JPwfdW9O9Ty17R94q"
-                b"zlf+jou4VfIGtsxe8XuX6nXvzWz1O8Xv6SLSG9Gnb3Kr32IvFqjVQz2FN5/f505fuTXu"
-                b"9JIuULufpX6Pjq4BJegSDg=="
-            )
-        )
+                import base64
+                import zlib
 
-        for i in range(0, len(logo), 1024):
-            ops.write(base_addr + i, logo[i:i + 1024])
+                logo = zlib.decompress(
+                    base64.decodebytes(
+                        b"eJytlVty0zAUhhtZx7JiJ07SJDwALdMn2ADXcllAYQVAWQB7YB3cpsMwrFP9z5EtK/Kl"
+                        b"ZeBBo3P5P0mWj6Qvbqb+OKVOXaZ+O63uO1K/0E7QrtAeIHaFRtDt0Qj2T/EztUXTja+h"
+                        b"3aCx/0PihLwW/3vT7ySfBX/f9N+aceYuo3kSsy4niz6LYoUrqBBdpr42+qGYcXZSl46X"
+                        b"JfMWYS2cI6xPRes7/Kb0my+xV+fJvrxH/yLZuw+InSf762N+7z+if4n+FD3br5p/dIn2"
+                        b"GmOcoH2C/QbswuVoM6ypBkPqHfwzd6yeB3urnqF/K/ZOPQ32Xj0ZtHPsgznw5/Af/6PP"
+                        b"411M+A9l3jiWq0eDMZK+jdmG5dgGtbR0hs6iXAV/1+TXjqh0JeXojdPEMW9z3M/F+eNI"
+                        b"P3cLIvS52KzPxWZ9gfE5v4n01tWkR/Wsq2ndfHMt9bZq9Fo0sd7I+CtaHehzrCcn1Kas"
+                        b"yzMm2MavRTSHnP/OMS6Xubym44z4HaepSjiCrryB4+/zXCF2ytUy9xCnaZFwWv7pIbdE"
+                        b"3vvDTOZsb66Y4bk8Y8W+HaNRa75+Zqi7llOuDPvouQLn08o/Hee2qL2U0cjrwCnYdeA0"
+                        b"/L/nFObzXIV1GlUkbNWMPc2W2JuY5TPTZ9leBZbXxOwc/z0P7FJqYJrNMG/HGmV6rN8L"
+                        b"CiyFNXeslfqeZsuIs8R5Pt95xFTShhmN2iiRtz2mwFwxU4X/7xl/ZjrmrtQP18mYvozu"
+                        b"rb7eyP61DPbslkx7BmLGKOox/jzznaJuYBbu3iTDd90wo0XfMlk40+OMdctGH983Y/pC"
+                        b"/ssY074HfcaiJjzTvxNv4mrR9+/g/8F1fsd57TTLZ8JGrOG7Ss6JPwfdW9O9Ty17R94q"
+                        b"zlf+jou4VfIGtsxe8XuX6nXvzWz1O8Xv6SLSG9Gnb3Kr32IvFqjVQz2FN5/f505fuTXu"
+                        b"9JIuULufpX6Pjq4BJegSDg=="
+                    )
+                )
 
-        print("All tests passed")
+                for i in range(0, len(logo), 1024):
+                    ops.write(base_addr + i, logo[i:i + 1024])
+
+                print("All tests passed")
+                return
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                if not args.loop:
+                    raise
+                print(f"Attempt {attempt} failed: {exc}")
+                time.sleep(0.2)
+            finally:
+                if ftdi is not None:
+                    ftdi.close()
+                if mcd_session is not None:
+                    mcd_session.close()
     finally:
-        if ftdi is not None:
-            ftdi.close()
-        if mcd_session is not None:
-            mcd_session.close()
+        if trigger_serial is not None:
+            trigger_serial.close()
 
 
 if __name__ == "__main__":
