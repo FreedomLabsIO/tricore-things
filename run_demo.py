@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from dataclasses import dataclass
 import os
 import random
 import struct
@@ -216,6 +217,43 @@ def wait_for_dap_status(
     )
 
 
+@dataclass
+class RawDapSession:
+    ftdi: Ftdi
+    ops: DAPOperations
+    before_status: int
+    final_status: int
+
+
+class UnlockFailure(RuntimeError):
+    def __init__(self, before_status: int, final_status: int, hint: str) -> None:
+        self.before_status = before_status
+        self.final_status = final_status
+        self.hint = hint
+        super().__init__(
+            f"Unlock failed after the password sequence; final DAP status was "
+            f"0x{final_status:03x}. {hint}"
+        )
+
+    def format_summary(self, attempt: int) -> str:
+        line = (
+            f"Unlock attempt {attempt}  "
+            f"DAP status before unlock: 0x{self.before_status:03x} | "
+            f"final DAP status was 0x{self.final_status:03x}. | FAILED"
+        )
+        if self.hint:
+            line += f" | {self.hint}"
+        return line
+
+
+def unlock_failure_hint(final_status: int) -> str:
+    if final_status == 0x080:
+        return "Password handshake interrupted before evaluation."
+    if final_status == 0x0A0:
+        return "Check UNLOCK_PASSWORD."
+    return "Unlock failed."
+
+
 def prefer_mcd_backend(use_miniwiggler: bool) -> bool:
     requested = os.environ.get("TRICORE_THINGS_BACKEND", "").strip().lower()
     if requested:
@@ -284,7 +322,8 @@ def open_raw_dap(
     verbose_unlock: bool = False,
     password_pause: bool = False,
     trigger_serial=None,
-) -> tuple[Ftdi, DAPOperations]:
+    compact_log: bool = False,
+) -> RawDapSession:
     ftdi: Ftdi | None = None
     try:
         ftdi = open_ftdi_device(use_miniwiggler)
@@ -312,10 +351,12 @@ def open_raw_dap(
             batch.exec()
             dap_status = status.value or 0
 
-        print(f"DAP status before unlock decision: 0x{dap_status:03x}")
+        if not compact_log:
+            print(f"DAP status before unlock: 0x{dap_status:03x}")
 
         if dap_status == 0x400:
-            print("DAP was already unlocked")
+            if not compact_log:
+                print("DAP was already unlocked")
         else:
             if use_miniwiggler and UNLOCK_PASSWORD is not None:
                 ftdi.close()
@@ -362,14 +403,15 @@ def open_raw_dap(
                 final_status = batch.dap_readreg(0xB, 2)
                 batch.exec()
                 if (final_status.value or 0) != 0x400:
-                    raise RuntimeError(
-                        "Unlock failed after the password sequence; "
-                        f"final DAP status was 0x{(final_status.value or 0):03x}. "
-                        "Check UNLOCK_PASSWORD."
+                    raise UnlockFailure(
+                        before_status=dap_status,
+                        final_status=final_status.value or 0,
+                        hint=unlock_failure_hint(final_status.value or 0),
                     )
 
-                print("Unlocked with capture-derived MiniWiggler sequence")
-                print("DAP status after unlock handling: 0x400")
+                if not compact_log:
+                    print("Unlocked with capture-derived MiniWiggler sequence")
+                    print("DAP status after unlock handling: 0x400")
             else:
                 if dap_status == 0xC0:
                     batch.dap_write_ojconf(0x503)
@@ -385,12 +427,14 @@ def open_raw_dap(
                     else:
                         dap_status = 0x80
                     dap_status = 0x80
-                    print("DAP transitioned to password-unlock state: 0x080")
+                    if not compact_log:
+                        print("DAP transitioned to password-unlock state: 0x080")
 
                 if dap_status != 0x80:
                     raise Exception(f"Unexpected status: 0x{dap_status:x}")
 
-                print("DAP is locked, attempting unlock")
+                if not compact_log:
+                    print("DAP is locked, attempting unlock")
                 assert UNLOCK_PASSWORD is not None
                 batch.dap_set_io_client(1)
                 batch.dap_readreg(0xB, 2).then(AssertInt(0x80))
@@ -409,10 +453,17 @@ def open_raw_dap(
                 batch.dap_set_io_client(1)
                 batch.exec()
                 batch.dap_set_io_client(1)
-                batch.dap_readreg(0xB, 2).then(AssertInt(0x400))
+                final_status = batch.dap_readreg(0xB, 2)
                 batch.exec()
-                print("Unlocked")
-                print("DAP status after unlock handling: 0x400")
+                if (final_status.value or 0) != 0x400:
+                    raise UnlockFailure(
+                        before_status=dap_status,
+                        final_status=final_status.value or 0,
+                        hint=unlock_failure_hint(final_status.value or 0),
+                    )
+                if not compact_log:
+                    print("Unlocked")
+                    print("DAP status after unlock handling: 0x400")
 
         batch.dap_set_io_client(1)
         batch.dap_readreg(0xB, 2).then(AssertInt(0x400))
@@ -427,7 +478,12 @@ def open_raw_dap(
         batch.mpsse_set_clk_freq(5_000_000)
         batch.exec()
 
-        return ftdi, DAPOperations(batch)
+        return RawDapSession(
+            ftdi=ftdi,
+            ops=DAPOperations(batch),
+            before_status=dap_status,
+            final_status=0x400,
+        )
     except Exception:
         if ftdi is not None:
             try:
@@ -488,21 +544,33 @@ def main() -> None:
             mcd_session: McdSession | None = None
             attempt += 1
             try:
-                if args.loop:
-                    print(f"Unlock attempt {attempt}")
-
                 if prefer_mcd_backend(use_miniwiggler):
                     mcd_session = McdSession.connect_default()
                     mcd_session.reset_and_halt()
                     ops = mcd_session
+                    if args.loop:
+                        print(
+                            f"Unlock attempt {attempt}  "
+                            "DAP status before unlock: 0x400 | "
+                            "final DAP status was 0x400. | OK"
+                        )
                     print(f"Using backend: MCD ({mcd_session.device_name} / {mcd_session.core_name})")
                 else:
-                    ftdi, ops = open_raw_dap(
+                    raw_session = open_raw_dap(
                         use_miniwiggler,
                         verbose_unlock=args.verbose_unlock,
                         password_pause=args.password_pause,
                         trigger_serial=trigger_serial,
+                        compact_log=args.loop,
                     )
+                    ftdi = raw_session.ftdi
+                    ops = raw_session.ops
+                    if args.loop:
+                        print(
+                            f"Unlock attempt {attempt}  "
+                            f"DAP status before unlock: 0x{raw_session.before_status:03x} | "
+                            f"final DAP status was 0x{raw_session.final_status:03x}. | OK"
+                        )
                     print("Using backend: raw MPSSE/DAP")
 
                 if run_self_test:
@@ -589,10 +657,15 @@ def main() -> None:
                 return
             except KeyboardInterrupt:
                 raise
+            except UnlockFailure as exc:
+                if not args.loop:
+                    raise
+                print(exc.format_summary(attempt))
+                time.sleep(0.2)
             except Exception as exc:
                 if not args.loop:
                     raise
-                print(f"Attempt {attempt} failed: {exc}")
+                print(f"Unlock attempt {attempt}  FAILED | {exc}")
                 time.sleep(0.2)
             finally:
                 if ftdi is not None:
