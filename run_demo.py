@@ -285,147 +285,156 @@ def open_raw_dap(
     password_pause: bool = False,
     trigger_serial=None,
 ) -> tuple[Ftdi, DAPOperations]:
-    ftdi = open_ftdi_device(use_miniwiggler)
+    ftdi: Ftdi | None = None
+    try:
+        ftdi = open_ftdi_device(use_miniwiggler)
 
-    if use_miniwiggler:
-        interface = MiniWigglerBatch(ftdi)
-    else:
-        interface = TigardBatch(ftdi)
+        if use_miniwiggler:
+            interface = MiniWigglerBatch(ftdi)
+        else:
+            interface = TigardBatch(ftdi)
 
-    batch = DAPBatch(interface)
+        batch = DAPBatch(interface)
 
-    if use_miniwiggler:
-        miniwiggler_sync(batch, interface)
-        miniwiggler_attach(batch)
-        dap_status = miniwiggler_wait_for_unlock_state(batch, interface)
-    else:
-        batch.test_reset()
-        batch.mpsse_set_clk_freq(720_000)
-        batch.reset()
-        batch.exec()
-        batch.dap_dapisc(16, 0xF00).then(AssertNone())
-        batch.dap_dapisc(48, 0x4ABBAF530400).then(AssertInt(0x400))
-        batch.dap_set_io_client(1)
-        status = batch.dap_readreg(0xB, 2)
-        batch.exec()
-        dap_status = status.value or 0
-
-    print(f"DAP status before unlock decision: 0x{dap_status:03x}")
-
-    if dap_status == 0x400:
-        print("DAP was already unlocked")
-    else:
-        if use_miniwiggler and UNLOCK_PASSWORD is not None:
-            ftdi.close()
-            ftdi = open_ftdi_device(True)
-            replay_miniwiggler_memtool_unlock_preamble(
-                ftdi,
-                verbose=verbose_unlock,
-            )
-            interface = MiniWigglerBatch(ftdi, initialize=False)
-            batch = DAPBatch(interface)
-            batch.dap_set_io_client(1)
-            password_state = batch.dap_readreg(0xB, 2)
+        if use_miniwiggler:
+            miniwiggler_sync(batch, interface)
+            miniwiggler_attach(batch)
+            dap_status = miniwiggler_wait_for_unlock_state(batch, interface)
+        else:
+            batch.test_reset()
+            batch.mpsse_set_clk_freq(720_000)
+            batch.reset()
             batch.exec()
-            status_after_preamble = password_state.value or 0
-            if verbose_unlock:
-                print(
-                    "unlock preamble complete, "
-                    f"DAP status is 0x{status_after_preamble:03x}"
-                )
-            if status_after_preamble != 0x80:
-                raise RuntimeError(
-                    "Capture-derived MiniWiggler preamble did not reach the "
-                    f"password-ready state, got 0x{status_after_preamble:03x}"
-                )
+            batch.dap_dapisc(16, 0xF00).then(AssertNone())
+            batch.dap_dapisc(48, 0x4ABBAF530400).then(AssertInt(0x400))
+            batch.dap_set_io_client(1)
+            status = batch.dap_readreg(0xB, 2)
+            batch.exec()
+            dap_status = status.value or 0
 
-            for index, pw in enumerate(UNLOCK_PASSWORD):
-                if password_pause:
-                    pause_before_password_word(index + 1, len(UNLOCK_PASSWORD))
-                batch.dap_readreg(0xB, 2).then(AssertInt(0x80))
-                batch.write_comdata(pw)
+        print(f"DAP status before unlock decision: 0x{dap_status:03x}")
+
+        if dap_status == 0x400:
+            print("DAP was already unlocked")
+        else:
+            if use_miniwiggler and UNLOCK_PASSWORD is not None:
+                ftdi.close()
+                ftdi = open_ftdi_device(True)
+                replay_miniwiggler_memtool_unlock_preamble(
+                    ftdi,
+                    verbose=verbose_unlock,
+                )
+                interface = MiniWigglerBatch(ftdi, initialize=False)
+                batch = DAPBatch(interface)
+                batch.dap_set_io_client(1)
+                password_state = batch.dap_readreg(0xB, 2)
                 batch.exec()
+                status_after_preamble = password_state.value or 0
                 if verbose_unlock:
                     print(
-                        f"password word {index + 1}/{len(UNLOCK_PASSWORD)} "
-                        "sent while DAP status was 0x080"
+                        "unlock preamble complete, "
+                        f"DAP status is 0x{status_after_preamble:03x}"
                     )
-                if index + 1 == len(UNLOCK_PASSWORD):
-                    send_post_password_command(trigger_serial, verbose_unlock)
+                if status_after_preamble != 0x80:
+                    raise RuntimeError(
+                        "Capture-derived MiniWiggler preamble did not reach the "
+                        f"password-ready state, got 0x{status_after_preamble:03x}"
+                    )
 
-            batch.dap_set_io_client(2)
-            batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
-            batch.dap_readreg(0xF, 2).then(AssertInt(0x0000))
-            batch.dap_set_io_client(1)
-            final_status = batch.dap_readreg(0xB, 2)
-            batch.exec()
-            if (final_status.value or 0) != 0x400:
-                raise RuntimeError(
-                    "Unlock failed after the password sequence; "
-                    f"final DAP status was 0x{(final_status.value or 0):03x}. "
-                    "Check UNLOCK_PASSWORD."
-                )
+                for index, pw in enumerate(UNLOCK_PASSWORD):
+                    if password_pause:
+                        pause_before_password_word(index + 1, len(UNLOCK_PASSWORD))
+                    batch.dap_readreg(0xB, 2).then(AssertInt(0x80))
+                    batch.write_comdata(pw)
+                    batch.exec()
+                    if verbose_unlock:
+                        print(
+                            f"password word {index + 1}/{len(UNLOCK_PASSWORD)} "
+                            "sent while DAP status was 0x080"
+                        )
+                    if index + 1 == len(UNLOCK_PASSWORD):
+                        send_post_password_command(trigger_serial, verbose_unlock)
 
-            print("Unlocked with capture-derived MiniWiggler sequence")
-            print("DAP status after unlock handling: 0x400")
-        else:
-            if dap_status == 0xC0:
-                batch.dap_write_ojconf(0x503)
-                status_after_ojconf = batch.dap_readreg(0xB, 2)
-                if UNLOCK_PASSWORD is not None:
-                    # See "3.1.1.7.7 Debug System handling" in TC3xx User's Manual
-                    batch.write_comdata(CMD_KEY_EXCHANGE)
-                status_samples = [batch.dap_readreg(0xB, 2) for _ in range(8)]
+                batch.dap_set_io_client(2)
+                batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
+                batch.dap_readreg(0xF, 2).then(AssertInt(0x0000))
+                batch.dap_set_io_client(1)
+                final_status = batch.dap_readreg(0xB, 2)
                 batch.exec()
-                sampled_statuses = [status_after_ojconf.value] + [s.value for s in status_samples]
-                if 0x80 not in sampled_statuses:
-                    dap_status = wait_for_dap_status(batch, {0x80}, timeout_s=0.4)
-                else:
+                if (final_status.value or 0) != 0x400:
+                    raise RuntimeError(
+                        "Unlock failed after the password sequence; "
+                        f"final DAP status was 0x{(final_status.value or 0):03x}. "
+                        "Check UNLOCK_PASSWORD."
+                    )
+
+                print("Unlocked with capture-derived MiniWiggler sequence")
+                print("DAP status after unlock handling: 0x400")
+            else:
+                if dap_status == 0xC0:
+                    batch.dap_write_ojconf(0x503)
+                    status_after_ojconf = batch.dap_readreg(0xB, 2)
+                    if UNLOCK_PASSWORD is not None:
+                        # See "3.1.1.7.7 Debug System handling" in TC3xx User's Manual
+                        batch.write_comdata(CMD_KEY_EXCHANGE)
+                    status_samples = [batch.dap_readreg(0xB, 2) for _ in range(8)]
+                    batch.exec()
+                    sampled_statuses = [status_after_ojconf.value] + [s.value for s in status_samples]
+                    if 0x80 not in sampled_statuses:
+                        dap_status = wait_for_dap_status(batch, {0x80}, timeout_s=0.4)
+                    else:
+                        dap_status = 0x80
                     dap_status = 0x80
-                dap_status = 0x80
-                print("DAP transitioned to password-unlock state: 0x080")
+                    print("DAP transitioned to password-unlock state: 0x080")
 
-            if dap_status != 0x80:
-                raise Exception(f"Unexpected status: 0x{dap_status:x}")
+                if dap_status != 0x80:
+                    raise Exception(f"Unexpected status: 0x{dap_status:x}")
 
-            print("DAP is locked, attempting unlock")
-            assert UNLOCK_PASSWORD is not None
-            batch.dap_set_io_client(1)
-            batch.dap_readreg(0xB, 2).then(AssertInt(0x80))
-            batch.exec()
-            for index, pw in enumerate(UNLOCK_PASSWORD):
-                if password_pause:
-                    pause_before_password_word(index + 1, len(UNLOCK_PASSWORD))
+                print("DAP is locked, attempting unlock")
+                assert UNLOCK_PASSWORD is not None
+                batch.dap_set_io_client(1)
                 batch.dap_readreg(0xB, 2).then(AssertInt(0x80))
-                batch.write_comdata(pw)
                 batch.exec()
-                if index + 1 == len(UNLOCK_PASSWORD):
-                    send_post_password_command(trigger_serial, verbose_unlock)
-            batch.dap_set_io_client(2)
-            batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
-            batch.dap_readreg(0xF, 2).then(AssertInt(0x0000))
-            batch.dap_set_io_client(1)
-            batch.exec()
-            batch.dap_set_io_client(1)
-            batch.dap_readreg(0xB, 2).then(AssertInt(0x400))
-            batch.exec()
-            print("Unlocked")
-            print("DAP status after unlock handling: 0x400")
+                for index, pw in enumerate(UNLOCK_PASSWORD):
+                    if password_pause:
+                        pause_before_password_word(index + 1, len(UNLOCK_PASSWORD))
+                    batch.dap_readreg(0xB, 2).then(AssertInt(0x80))
+                    batch.write_comdata(pw)
+                    batch.exec()
+                    if index + 1 == len(UNLOCK_PASSWORD):
+                        send_post_password_command(trigger_serial, verbose_unlock)
+                batch.dap_set_io_client(2)
+                batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
+                batch.dap_readreg(0xF, 2).then(AssertInt(0x0000))
+                batch.dap_set_io_client(1)
+                batch.exec()
+                batch.dap_set_io_client(1)
+                batch.dap_readreg(0xB, 2).then(AssertInt(0x400))
+                batch.exec()
+                print("Unlocked")
+                print("DAP status after unlock handling: 0x400")
 
-    batch.dap_set_io_client(1)
-    batch.dap_readreg(0xB, 2).then(AssertInt(0x400))
-    batch.exec()
+        batch.dap_set_io_client(1)
+        batch.dap_readreg(0xB, 2).then(AssertInt(0x400))
+        batch.exec()
 
-    batch.dap_set_io_client(1)
-    batch.dap_readreg(0xB, 2).then(AssertInt(0x400))
-    batch.dap_write_ojconf(0x4501)
-    batch.dap_writereg_0(0xC1)
-    batch.exec()
+        batch.dap_set_io_client(1)
+        batch.dap_readreg(0xB, 2).then(AssertInt(0x400))
+        batch.dap_write_ojconf(0x4501)
+        batch.dap_writereg_0(0xC1)
+        batch.exec()
 
-    batch.mpsse_set_clk_freq(5_000_000)
-    batch.exec()
+        batch.mpsse_set_clk_freq(5_000_000)
+        batch.exec()
 
-    return ftdi, DAPOperations(batch)
+        return ftdi, DAPOperations(batch)
+    except Exception:
+        if ftdi is not None:
+            try:
+                ftdi.close()
+            except Exception:
+                pass
+        raise
 
 
 def parse_args() -> argparse.Namespace:
