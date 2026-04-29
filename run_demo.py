@@ -235,9 +235,11 @@ class UnlockFailure(RuntimeError):
             f"0x{final_status:03x}. {hint}"
         )
 
-    def format_summary(self, attempt: int) -> str:
-        line = (
-            f"Unlock attempt {attempt}  "
+    def format_summary(self, attempt: int, delay_s: float | None = None) -> str:
+        line = f"Unlock attempt {attempt}  "
+        if delay_s is not None:
+            line += f"delay: {delay_s:.6f}s | "
+        line += (
             f"DAP status before unlock: 0x{self.before_status:03x} | "
             f"final DAP status was 0x{self.final_status:03x}. | FAILED"
         )
@@ -252,6 +254,23 @@ def unlock_failure_hint(final_status: int) -> str:
     if final_status == 0x0A0:
         return "Check UNLOCK_PASSWORD."
     return "Unlock failed."
+
+
+def format_attempt_status_line(
+    attempt: int,
+    before_status: int,
+    final_status: int,
+    result: str,
+    delay_s: float | None = None,
+) -> str:
+    line = f"Unlock attempt {attempt}  "
+    if delay_s is not None:
+        line += f"delay: {delay_s:.6f}s | "
+    line += (
+        f"DAP status before unlock: 0x{before_status:03x} | "
+        f"final DAP status was 0x{final_status:03x}. | {result}"
+    )
+    return line
 
 
 def prefer_mcd_backend(use_miniwiggler: bool) -> bool:
@@ -308,9 +327,20 @@ def open_trigger_serial(port: str):
     )
 
 
-def send_post_password_command(trigger_serial, verbose_unlock: bool) -> None:
+def send_post_password_command(
+    trigger_serial,
+    verbose_unlock: bool,
+    delay_s: float = 0.0,
+) -> None:
     if trigger_serial is None:
         return
+    if delay_s > 0:
+        if verbose_unlock:
+            print(
+                f'waiting {delay_s:.6f}s before sending "p<cr>" on '
+                f"{trigger_serial.port}"
+            )
+        time.sleep(delay_s)
     trigger_serial.write(b"p\r")
     trigger_serial.flush()
     if verbose_unlock:
@@ -323,6 +353,7 @@ def open_raw_dap(
     password_pause: bool = False,
     trigger_serial=None,
     compact_log: bool = False,
+    trigger_delay_s: float = 0.0,
 ) -> RawDapSession:
     ftdi: Ftdi | None = None
     try:
@@ -394,7 +425,11 @@ def open_raw_dap(
                             "sent while DAP status was 0x080"
                         )
                     if index + 1 == len(UNLOCK_PASSWORD):
-                        send_post_password_command(trigger_serial, verbose_unlock)
+                        send_post_password_command(
+                            trigger_serial,
+                            verbose_unlock,
+                            delay_s=trigger_delay_s,
+                        )
 
                 batch.dap_set_io_client(2)
                 batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
@@ -446,7 +481,11 @@ def open_raw_dap(
                     batch.write_comdata(pw)
                     batch.exec()
                     if index + 1 == len(UNLOCK_PASSWORD):
-                        send_post_password_command(trigger_serial, verbose_unlock)
+                        send_post_password_command(
+                            trigger_serial,
+                            verbose_unlock,
+                            delay_s=trigger_delay_s,
+                        )
                 batch.dap_set_io_client(2)
                 batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
                 batch.dap_readreg(0xF, 2).then(AssertInt(0x0000))
@@ -523,7 +562,68 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep retrying the unlock flow until one attempt succeeds.",
     )
+    parser.add_argument(
+        "--start-delay",
+        type=float,
+        help=(
+            "Delay in seconds before sending 'p<cr>' on the COM port for the "
+            "first sweep value."
+        ),
+    )
+    parser.add_argument(
+        "--end-delay",
+        type=float,
+        help=(
+            "Maximum delay in seconds to try before sending 'p<cr>' on the "
+            "COM port."
+        ),
+    )
+    parser.add_argument(
+        "--increment",
+        type=float,
+        help="Increment in seconds between COM trigger delay sweep values.",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        help="Number of unlock attempts to perform at each delay value.",
+    )
     return parser.parse_args()
+
+
+def build_delay_schedule(args: argparse.Namespace) -> list[float] | None:
+    delay_values = [
+        args.start_delay,
+        args.end_delay,
+        args.increment,
+        args.attempts,
+    ]
+    if all(value is None for value in delay_values):
+        return None
+    if any(value is None for value in delay_values):
+        raise ValueError(
+            "--start-delay, --end-delay, --increment, and --attempts must "
+            "all be provided together."
+        )
+    if not args.com_port:
+        raise ValueError("Delay sweep options require --com-port.")
+    if args.start_delay < 0 or args.end_delay < 0:
+        raise ValueError("Delay values must be non-negative.")
+    if args.end_delay < args.start_delay:
+        raise ValueError("--end-delay must be greater than or equal to --start-delay.")
+    if args.increment <= 0:
+        raise ValueError("--increment must be greater than zero.")
+    if args.attempts <= 0:
+        raise ValueError("--attempts must be greater than zero.")
+
+    delays: list[float] = []
+    current = args.start_delay
+    epsilon = args.increment / 1000.0
+    while current <= args.end_delay + epsilon:
+        rounded = round(current, 12)
+        delays.extend([rounded] * args.attempts)
+        current += args.increment
+    return delays
 
 
 def main() -> None:
@@ -531,28 +631,42 @@ def main() -> None:
     run_self_test = True
     use_miniwiggler = True
     base_addr = 0x7000002C
+    delay_schedule = build_delay_schedule(args)
 
     trigger_serial = None
     if args.com_port:
         trigger_serial = open_trigger_serial(args.com_port)
 
     attempt = 0
+    last_failure: Exception | None = None
 
     try:
         while True:
             ftdi: Ftdi | None = None
             mcd_session: McdSession | None = None
             attempt += 1
+            current_delay = None
+            if delay_schedule is not None:
+                if args.loop:
+                    current_delay = delay_schedule[(attempt - 1) % len(delay_schedule)]
+                else:
+                    if attempt > len(delay_schedule):
+                        break
+                    current_delay = delay_schedule[attempt - 1]
             try:
                 if prefer_mcd_backend(use_miniwiggler):
                     mcd_session = McdSession.connect_default()
                     mcd_session.reset_and_halt()
                     ops = mcd_session
-                    if args.loop:
+                    if args.loop or delay_schedule is not None:
                         print(
-                            f"Unlock attempt {attempt}  "
-                            "DAP status before unlock: 0x400 | "
-                            "final DAP status was 0x400. | OK"
+                            format_attempt_status_line(
+                                attempt,
+                                before_status=0x400,
+                                final_status=0x400,
+                                result="OK",
+                                delay_s=current_delay,
+                            )
                         )
                     print(f"Using backend: MCD ({mcd_session.device_name} / {mcd_session.core_name})")
                 else:
@@ -561,15 +675,20 @@ def main() -> None:
                         verbose_unlock=args.verbose_unlock,
                         password_pause=args.password_pause,
                         trigger_serial=trigger_serial,
-                        compact_log=args.loop,
+                        compact_log=(args.loop or delay_schedule is not None),
+                        trigger_delay_s=current_delay or 0.0,
                     )
                     ftdi = raw_session.ftdi
                     ops = raw_session.ops
-                    if args.loop:
+                    if args.loop or delay_schedule is not None:
                         print(
-                            f"Unlock attempt {attempt}  "
-                            f"DAP status before unlock: 0x{raw_session.before_status:03x} | "
-                            f"final DAP status was 0x{raw_session.final_status:03x}. | OK"
+                            format_attempt_status_line(
+                                attempt,
+                                before_status=raw_session.before_status,
+                                final_status=raw_session.final_status,
+                                result="OK",
+                                delay_s=current_delay,
+                            )
                         )
                     print("Using backend: raw MPSSE/DAP")
 
@@ -658,20 +777,30 @@ def main() -> None:
             except KeyboardInterrupt:
                 raise
             except UnlockFailure as exc:
-                if not args.loop:
+                last_failure = exc
+                if not args.loop and delay_schedule is None:
                     raise
-                print(exc.format_summary(attempt))
+                print(exc.format_summary(attempt, delay_s=current_delay))
                 time.sleep(0.2)
             except Exception as exc:
-                if not args.loop:
+                last_failure = exc
+                if not args.loop and delay_schedule is None:
                     raise
-                print(f"Unlock attempt {attempt}  FAILED | {exc}")
+                line = f"Unlock attempt {attempt}  "
+                if current_delay is not None:
+                    line += f"delay: {current_delay:.6f}s | "
+                line += f"FAILED | {exc}"
+                print(line)
                 time.sleep(0.2)
             finally:
                 if ftdi is not None:
                     ftdi.close()
                 if mcd_session is not None:
                     mcd_session.close()
+        if delay_schedule is not None and last_failure is not None:
+            raise SystemExit(
+                "No successful unlock after exhausting the configured delay sweep."
+            )
     finally:
         if trigger_serial is not None:
             trigger_serial.close()
