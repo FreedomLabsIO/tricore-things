@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-import pyftdi
-from pyftdi.ftdi import Ftdi
 from bitarray import bitarray
+from ftdi_compat import Ftdi
 
 from ftdi_dap import AssertInt, AssertNone, DAPBatch, DAPInterface, \
     DAPOperations, FtdiBatch, Promise
@@ -129,8 +128,8 @@ if __name__ == '__main__':
     ftdi.set_latency_timer(2)
     ftdi.set_flowctrl('hw')
     ftdi.set_rts(True)
-    ftdi.set_bitmode(0, pyftdi.ftdi.Ftdi.BitMode.RESET)
-    ftdi.set_bitmode(0, pyftdi.ftdi.Ftdi.BitMode.MPSSE)
+    ftdi.set_bitmode(0, Ftdi.BitMode.RESET)
+    ftdi.set_bitmode(0, Ftdi.BitMode.MPSSE)
     assert ftdi.is_connected
 
     dxcpl = TigardDxcplBatch(ftdi)

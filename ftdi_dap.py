@@ -5,7 +5,7 @@ import struct
 import sys
 import types
 from typing import Callable, Optional, TypeVar, Any
-from pyftdi.ftdi import Ftdi
+from ftdi_compat import Ftdi
 from bitarray import bitarray
 from bitarray.util import int2ba
 
@@ -92,6 +92,21 @@ def AssertBytes(x: str) -> Callable[[bytes], None]:
         if b != bytes.fromhex(x):
             raise AssertionError.with_traceback(AssertionError(
                 f"{b.hex()} != {x}"), tb)
+    tb = traceback()
+    return curry
+
+
+def AssertBytesAny(*choices: str) -> Callable[[bytes], None]:
+    expected = {bytes.fromhex(choice) for choice in choices}
+
+    def curry(b: bytes) -> None:
+        if b not in expected:
+            expected_hex = ", ".join(choices)
+            raise AssertionError.with_traceback(
+                AssertionError(f"{b.hex()} not in {{{expected_hex}}}"),
+                tb,
+            )
+
     tb = traceback()
     return curry
 
@@ -258,8 +273,11 @@ class MiniWigglerBatch(DAPInterface):
     GPIOL_TRST = b'\x80\x00\x4b'  # TCK=0, TDI=0, TMS=0, USR0=0
     GPIOL_OPEN_CLK = b'\x80\x80\xda'
 
-    def __init__(self, ftdi: Ftdi) -> None:
+    def __init__(self, ftdi: Ftdi, initialize: bool = True) -> None:
         FtdiBatch.__init__(self, ftdi)
+
+        if not initialize:
+            return
 
         # The official Infineon software does this, I don't know what it is
         a = self.append(b'\xaa', 2)
@@ -272,12 +290,13 @@ class MiniWigglerBatch(DAPInterface):
         # Disable adaptive clocking (return clock signal)
         # Disable 3 Phase Data Clocking (data only valid for 1 edge)
         self.append(b'\x8a\x97\x8d')
-
-        self.test_reset()
-        self.read_gpios().then(AssertBytes('a01f'))
         self.append(MiniWigglerBatch.GPIOH_INPUT)
         self.append(MiniWigglerBatch.GPIOL_NORMAL)
+        gpios = self.read_gpios()
         self.exec()
+        # On full-bus captures the adapter typically reports a05f here, but
+        # older traces and some driver stacks have shown the 1f variant.
+        gpios.then(AssertBytesAny('a05f', '805f', 'a01f', '801f'))
 
     def dap_output_bytes(self, b: bitarray) -> None:
         self.append(MiniWigglerBatch.GPIOH_OUTPUT)
@@ -441,7 +460,7 @@ class DAPBatch:
                 assert b[4] == crc, b
                 return rx
 
-        return self.dap_telegram(16, 0, None, 56).then(on_response)
+        return self.dap_telegram(16, 0, None, 7).then(on_response)
 
     def dap_dapisc(self, sz: int, data: int) -> Promise[int | None]:
         def on_response(b: bytes) -> int | None:
@@ -457,8 +476,14 @@ class DAPBatch:
 
         return self.dap_telegram(17, sz, data, 5).then(on_response)
 
+    def dap_jtag_reset(self) -> None:
+        self.dap_telegram(21, 0, None, 3).then(AssertZero())
+
     def dap_jtag_set_ir(self) -> None:
-        self.dap_telegram(19, 8, 4, 3).then(AssertBytes('000002'))
+        # Depending on whether the transport hands back the raw three-byte
+        # response or the already-unpadded payload view, this can appear as
+        # either 000002 or the equivalent single-byte 00.
+        self.dap_telegram(19, 8, 4, 3).then(AssertBytesAny('000002', '00'))
 
     def dap_set_io_client(self, x: int) -> None:
         self.dap_telegram(28, 3, x, 3).then(AssertZero())
