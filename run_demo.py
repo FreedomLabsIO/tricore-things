@@ -65,6 +65,8 @@ MINIWIGGLER_SYNC_SWEEP_B = bytes.fromhex(
 )
 MINIWIGGLER_SYNC_SWEEP_C = bytes.fromhex("3f8e033ff0033ff0e3c071")
 MINIWIGGLER_SYNC_PROBE = bytes.fromhex("801f3870fcf871")
+POST_PASSWORD_SETTLE_TIMEOUT_S = 0.005
+POST_PASSWORD_POLL_S = 0.0005
 
 
 def miniwiggler_sync(batch: DAPBatch, interface: MiniWigglerBatch) -> None:
@@ -258,7 +260,7 @@ class UnlockFailure(RuntimeError):
 
 def unlock_failure_hint(final_status: int) -> str:
     if final_status == 0x080:
-        return "Password handshake interrupted before evaluation."
+        return "Password handshake did not settle before timeout."
     if final_status == 0x0A0:
         return "Check UNLOCK_PASSWORD."
     return "Unlock failed."
@@ -294,6 +296,24 @@ def probe_identity_read(batch: DAPBatch) -> str:
         f"SBU_MANID=0x{manid:08x} "
         f"SBU_CHIPID=0x{chipid:08x}"
     )
+
+
+def wait_for_post_password_status(
+    batch: DAPBatch,
+    timeout_s: float = POST_PASSWORD_SETTLE_TIMEOUT_S,
+    poll_s: float = POST_PASSWORD_POLL_S,
+) -> int:
+    deadline = time.monotonic() + timeout_s
+    status = read_dap_status(batch)
+    if status != 0x080:
+        return status
+
+    while time.monotonic() < deadline:
+        time.sleep(poll_s)
+        status = read_dap_status(batch)
+        if status != 0x080:
+            return status
+    return status
 
 
 def prefer_mcd_backend(use_miniwiggler: bool) -> bool:
@@ -475,17 +495,16 @@ def open_raw_dap(
                 batch.dap_set_io_client(2)
                 batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
                 batch.dap_readreg(0xF, 2).then(AssertInt(0x0000))
-                batch.dap_set_io_client(1)
-                final_status = batch.dap_readreg(0xB, 2)
                 batch.exec()
+                final_status_value = wait_for_post_password_status(batch)
                 identity_probe = None
-                if (final_status.value or 0) == 0x080:
+                if final_status_value == 0x080:
                     identity_probe = probe_identity_read(batch)
-                if (final_status.value or 0) != 0x400:
+                if final_status_value != 0x400:
                     raise UnlockFailure(
                         before_status=dap_status,
-                        final_status=final_status.value or 0,
-                        hint=unlock_failure_hint(final_status.value or 0),
+                        final_status=final_status_value,
+                        hint=unlock_failure_hint(final_status_value),
                         identity_probe=identity_probe,
                     )
                 identity_probe = probe_identity_read(batch)
@@ -535,19 +554,16 @@ def open_raw_dap(
                 batch.dap_set_io_client(2)
                 batch.dap_readreg(0xB, 2).then(AssertInt(0x0000))
                 batch.dap_readreg(0xF, 2).then(AssertInt(0x0000))
-                batch.dap_set_io_client(1)
                 batch.exec()
-                batch.dap_set_io_client(1)
-                final_status = batch.dap_readreg(0xB, 2)
-                batch.exec()
+                final_status_value = wait_for_post_password_status(batch)
                 identity_probe = None
-                if (final_status.value or 0) == 0x080:
+                if final_status_value == 0x080:
                     identity_probe = probe_identity_read(batch)
-                if (final_status.value or 0) != 0x400:
+                if final_status_value != 0x400:
                     raise UnlockFailure(
                         before_status=dap_status,
-                        final_status=final_status.value or 0,
-                        hint=unlock_failure_hint(final_status.value or 0),
+                        final_status=final_status_value,
+                        hint=unlock_failure_hint(final_status_value),
                         identity_probe=identity_probe,
                     )
                 identity_probe = probe_identity_read(batch)
