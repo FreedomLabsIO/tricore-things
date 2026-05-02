@@ -67,6 +67,10 @@ MINIWIGGLER_SYNC_SWEEP_C = bytes.fromhex("3f8e033ff0033ff0e3c071")
 MINIWIGGLER_SYNC_PROBE = bytes.fromhex("801f3870fcf871")
 POST_PASSWORD_SETTLE_TIMEOUT_S = 0.005
 POST_PASSWORD_POLL_S = 0.0005
+PASSWORD_FAILURE_DAP_STATUS = 0x0A0
+TARGET_RESET_READY_DAP_STATUSES = {0x080, 0x0C0, 0x400}
+TARGET_RESET_WAIT_REPORT_S = 2.0
+TARGET_RESET_WAIT_POLL_S = 0.2
 
 
 def miniwiggler_sync(batch: DAPBatch, interface: MiniWigglerBatch) -> None:
@@ -140,6 +144,7 @@ def miniwiggler_attach(batch: DAPBatch) -> None:
 def miniwiggler_wait_for_unlock_state(
     batch: DAPBatch,
     interface: MiniWigglerBatch,
+    allow_recovery_reset: bool = True,
 ) -> int:
     deadline = time.monotonic() + 0.22
     status = 0
@@ -152,6 +157,9 @@ def miniwiggler_wait_for_unlock_state(
         if status in (0x80, 0xC0, 0x400):
             return status
         time.sleep(0.01)
+
+    if not allow_recovery_reset:
+        return status
 
     # On locked boards MemTool performs one more low-level reset/open-clock
     # dance before re-issuing DAPISC(0400). That transition moves the target
@@ -261,7 +269,7 @@ class UnlockFailure(RuntimeError):
 def unlock_failure_hint(final_status: int) -> str:
     if final_status == 0x080:
         return "Password handshake did not settle before timeout."
-    if final_status == 0x0A0:
+    if final_status == PASSWORD_FAILURE_DAP_STATUS:
         return "Check UNLOCK_PASSWORD."
     return "Unlock failed."
 
@@ -370,6 +378,74 @@ def open_trigger_serial(port: str):
     )
 
 
+def read_initial_dap_status_without_target_reset(use_miniwiggler: bool) -> int:
+    ftdi: Ftdi | None = None
+    try:
+        ftdi = open_ftdi_device(use_miniwiggler)
+        if use_miniwiggler:
+            interface = MiniWigglerBatch(ftdi)
+        else:
+            interface = TigardBatch(ftdi)
+
+        batch = DAPBatch(interface)
+        if use_miniwiggler:
+            miniwiggler_sync(batch, interface)
+            miniwiggler_attach(batch)
+            return miniwiggler_wait_for_unlock_state(
+                batch,
+                interface,
+                allow_recovery_reset=False,
+            )
+
+        batch.mpsse_set_clk_freq(720_000)
+        batch.exec()
+        batch.dap_dapisc(16, 0xF00).then(AssertNone())
+        batch.dap_dapisc(48, 0x4ABBAF530400).then(AssertInt(0x400))
+        batch.dap_set_io_client(1)
+        status = batch.dap_readreg(0xB, 2)
+        batch.exec()
+        return status.value or 0
+    finally:
+        if ftdi is not None:
+            ftdi.close()
+
+
+def wait_for_target_reset(use_miniwiggler: bool) -> int:
+    print("Waiting for target self-reset before the next unlock attempt...")
+    next_report = time.monotonic() + TARGET_RESET_WAIT_REPORT_S
+    last_status: int | None = None
+    last_error: Exception | None = None
+
+    while True:
+        try:
+            last_status = read_initial_dap_status_without_target_reset(
+                use_miniwiggler
+            )
+            last_error = None
+            if last_status in TARGET_RESET_READY_DAP_STATUSES:
+                print(f"Target reset observed; DAP status is 0x{last_status:03x}")
+                return last_status
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_error = exc
+
+        now = time.monotonic()
+        if now >= next_report:
+            if last_status is not None:
+                print(
+                    "Still waiting for target self-reset; "
+                    f"DAP status is 0x{last_status:03x}"
+                )
+            elif last_error is not None:
+                print(
+                    "Still waiting for target self-reset; "
+                    f"DAP probe failed: {last_error}"
+                )
+            next_report = now + TARGET_RESET_WAIT_REPORT_S
+        time.sleep(TARGET_RESET_WAIT_POLL_S)
+
+
 def wait_delay_ns(delay_ns: int) -> None:
     if delay_ns <= 0:
         return
@@ -414,6 +490,7 @@ def open_raw_dap(
     trigger_serial=None,
     compact_log: bool = False,
     trigger_delay_ns: int = 0,
+    auto_reset: bool = True,
 ) -> RawDapSession:
     ftdi: Ftdi | None = None
     try:
@@ -430,11 +507,17 @@ def open_raw_dap(
         if use_miniwiggler:
             miniwiggler_sync(batch, interface)
             miniwiggler_attach(batch)
-            dap_status = miniwiggler_wait_for_unlock_state(batch, interface)
+            dap_status = miniwiggler_wait_for_unlock_state(
+                batch,
+                interface,
+                allow_recovery_reset=auto_reset,
+            )
         else:
-            batch.test_reset()
+            if auto_reset:
+                batch.test_reset()
             batch.mpsse_set_clk_freq(720_000)
-            batch.reset()
+            if auto_reset:
+                batch.reset()
             batch.exec()
             batch.dap_dapisc(16, 0xF00).then(AssertNone())
             batch.dap_dapisc(48, 0x4ABBAF530400).then(AssertInt(0x400))
@@ -450,7 +533,9 @@ def open_raw_dap(
             if not compact_log:
                 print("DAP was already unlocked")
         else:
-            if use_miniwiggler and UNLOCK_PASSWORD is not None:
+            # The captured MiniWiggler preamble includes a physical reset group.
+            # In no-auto-reset mode, stay on the current DAP state instead.
+            if use_miniwiggler and UNLOCK_PASSWORD is not None and auto_reset:
                 ftdi.close()
                 ftdi = open_ftdi_device(True)
                 replay_miniwiggler_memtool_unlock_preamble(
@@ -513,6 +598,15 @@ def open_raw_dap(
                     print("Unlocked with capture-derived MiniWiggler sequence")
                     print("DAP status after unlock handling: 0x400")
             else:
+                if dap_status == PASSWORD_FAILURE_DAP_STATUS and not auto_reset:
+                    raise UnlockFailure(
+                        before_status=dap_status,
+                        final_status=dap_status,
+                        hint=(
+                            "Target is still in the post-password-failure state; "
+                            "retrying without target reset."
+                        ),
+                    )
                 if dap_status == 0xC0:
                     batch.dap_write_ojconf(0x503)
                     status_after_ojconf = batch.dap_readreg(0xB, 2)
@@ -634,6 +728,23 @@ def parse_args() -> argparse.Namespace:
         help="Keep retrying the unlock flow until one attempt succeeds.",
     )
     parser.add_argument(
+        "--disable-auto-reset",
+        action="store_true",
+        help=(
+            "After a password unlock failure with final DAP status 0x0a0, "
+            "retry without forcing a target-board reset."
+        ),
+    )
+    parser.add_argument(
+        "--wait-target-reset",
+        action="store_true",
+        help=(
+            "After a password unlock failure with final DAP status 0x0a0, "
+            "wait for the target to reset itself before retrying. This also "
+            "skips the next forced target-board reset."
+        ),
+    )
+    parser.add_argument(
         "--start-delay",
         type=int,
         help=(
@@ -740,6 +851,7 @@ def main() -> None:
 
     attempt = 0
     last_failure: Exception | None = None
+    suppress_auto_reset = False
 
     try:
         while True:
@@ -757,7 +869,8 @@ def main() -> None:
             try:
                 if prefer_mcd_backend(use_miniwiggler):
                     mcd_session = McdSession.connect_default()
-                    mcd_session.reset_and_halt()
+                    if not suppress_auto_reset:
+                        mcd_session.reset_and_halt()
                     ops = mcd_session
                     if args.loop or delay_schedule is not None:
                         print(
@@ -778,6 +891,7 @@ def main() -> None:
                         trigger_serial=trigger_serial,
                         compact_log=(args.loop or delay_schedule is not None),
                         trigger_delay_ns=current_delay or 0,
+                        auto_reset=not suppress_auto_reset,
                     )
                     ftdi = raw_session.ftdi
                     ops = raw_session.ops
@@ -883,15 +997,29 @@ def main() -> None:
                 raise
             except UnlockFailure as exc:
                 last_failure = exc
-                if not args.loop and delay_schedule is None:
+                reset_policy_handles_failure = (
+                    exc.final_status == PASSWORD_FAILURE_DAP_STATUS
+                    and (args.disable_auto_reset or args.wait_target_reset)
+                )
+                retry_without_loop = suppress_auto_reset or reset_policy_handles_failure
+                if not args.loop and delay_schedule is None and not retry_without_loop:
                     raise
                 print(exc.format_summary(attempt, delay_ns=current_delay))
                 if exc.identity_probe is not None:
                     print(f"Identity read: {exc.identity_probe}")
+                if reset_policy_handles_failure:
+                    suppress_auto_reset = True
+                    if args.wait_target_reset:
+                        wait_for_target_reset(use_miniwiggler)
+                    else:
+                        print(
+                            "Password failure left DAP at 0x0a0; retrying "
+                            "without forced target reset."
+                        )
                 time.sleep(0.2)
             except Exception as exc:
                 last_failure = exc
-                if not args.loop and delay_schedule is None:
+                if not args.loop and delay_schedule is None and not suppress_auto_reset:
                     raise
                 line = f"Unlock attempt {attempt}  "
                 if current_delay is not None:
